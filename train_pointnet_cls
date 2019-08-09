@@ -1,0 +1,201 @@
+import numpy as np
+import os
+import tensorflow as tf
+from keras import optimizers
+from keras.layers import Input
+from keras.models import Model
+from keras.layers import Dense, Flatten, Reshape, Dropout
+from keras.layers import Convolution1D, MaxPooling1D
+from keras.layers import Conv2D, MaxPooling2D, BatchNormalization
+from keras.layers import Lambda, Input
+from keras.utils import np_utils
+from Core.utils import utils
+from keras.callbacks import TensorBoard, ReduceLROnPlateau, LearningRateScheduler, ModelCheckpoint
+import keras.backend as K
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+import h5py
+util = utils()
+class PointNet():
+    def __init__(self, num_points, classes, batch_size):
+        self.num_points = num_points
+        self.classes = classes
+        self.Batch_size = batch_size
+        self.adam = optimizers.Adam(lr=0.001, decay=0.7)
+        #self.list_filename = 'data/modelnet40_ply_hdf5_2048/train_files.txt'
+        #self.train_path = 'data/modelnet40_ply_hdf5_2048/ply_data_train0.h5'
+        self.weight_path = 'train_log/weights'
+        self.log_path = 'train_log/logs'
+        self.ex_name = 'pointNet'
+        self.model = None
+        #self.TRAIN_FILES = [line.rstrip() for line in open(self.list_filename)]
+        if not os.path.exists(self.weight_path):
+            os.makedirs(self.weight_path)
+        if not os.path.exists(self.log_path):
+            os.makedirs(self.log_path)
+
+    def expand_dim(self, x, dim):
+        return K.expand_dims(x, dim)
+    def squeeze_dim(self, x, dim):
+        return K.squeeze(x, axis=dim)
+
+    def Input_transformation2D(self, input_points, KK=3):  ##input_points.shape=[Batch_size, Numpoints, 3]
+        #input_image = K.expand_dims(input_points, -1)
+        input_image = Lambda(self.expand_dim, arguments={'dim': -1})(input_points)
+        assert (KK == 3)
+        x = Conv2D(64, [1, 3], activation='relu',)(input_image)
+        x = BatchNormalization()(x)
+        x = Conv2D(128, [1, 1], activation='relu')(x)
+        x = BatchNormalization()(x)
+        x = Conv2D(1024, [1, 1], activation='relu')(x)
+        x = BatchNormalization()(x)
+        x = MaxPooling2D(pool_size=[self.num_points, 1])(x)
+        x = Dense(512, activation='relu')(x)
+        x = BatchNormalization()(x)
+        x = Dense(256, activation='relu')(x)
+        x = BatchNormalization()(x)
+
+        x = Dense(3*KK, weights=[np.zeros([256, 3*KK]), np.array([1, 0, 0, 0, 1, 0, 0, 0, 1]).astype(np.float32)])(x)
+        input_T = Reshape((3, KK))(x)
+        return input_T
+
+    def Featrue_transformation2D(self, input):
+        # feature transform net
+        f = Conv2D(64, [1, 1], activation='relu')(input)
+        f = BatchNormalization()(f)
+        f = Conv2D(128, [1, 1], activation='relu')(f)
+        f = BatchNormalization()(f)
+        f = Conv2D(1024, [1, 1], activation='relu')(f)
+        f = BatchNormalization()(f)
+        f = MaxPooling2D(pool_size=[self.num_points, 1])(f)
+        f = Dense(512, activation='relu')(f)
+        f = BatchNormalization()(f)
+        f = Dense(256, activation='relu')(f)
+        f = BatchNormalization()(f)
+        f = Dense(64 * 64, weights=[np.zeros([256, 64 * 64]), np.eye(64).flatten().astype(np.float32)])(f)
+        feature_T = Reshape((64, 64))(f)
+        return feature_T
+
+    def CreateNet(self, Inital_weight=False):
+
+        input_points = Input(shape=(self.num_points, 3))
+        input_T = self.Input_transformation2D(input_points)
+        g = Lambda(util.mat_mul, arguments={'B': input_T})(input_points)
+        g = Lambda(self.expand_dim, arguments={'dim': -1})(g)
+
+        g = Conv2D(64, [1, 3], activation='relu')(g)
+        g = BatchNormalization()(g)
+        g = Conv2D(64, [1, 1], activation='relu')(g)
+        g = BatchNormalization()(g)
+        #############################
+        Feature_T = self.Featrue_transformation2D(g)
+        g = Lambda(self.squeeze_dim, arguments={'dim': 2})(g)
+        g = Lambda(util.mat_mul, arguments={'B': Feature_T})(g)
+        g = Lambda(self.expand_dim, arguments={'dim': 2})(g)
+        g = Conv2D(64, [1, 1], activation='relu')(g)
+        g = BatchNormalization()(g)
+        g = Conv2D(128, [1, 1], activation='relu')(g)
+        g = BatchNormalization()(g)
+        g = Conv2D(1024, [1, 1], activation='relu')(g)
+        g = BatchNormalization()(g)
+
+        global_feature = MaxPooling2D(pool_size=[self.num_points, 1])(g)
+
+        c = Dense(512, activation='relu')(global_feature)
+        c = BatchNormalization()(c)
+        #c = Dropout(rate=0.1)(c)
+        c = Dense(256, activation='relu')(c)
+        c = BatchNormalization()(c)
+        c = Dropout(rate=0.1)(c)
+        c = Dense(self.classes, activation='softmax')(c)
+        prediction = Flatten()(c)
+
+        model = Model(inputs=input_points, outputs=prediction)
+        if Inital_weight:
+            model.load_weights('train_log/weights/pointNet.h5')
+            print('Weight Load! ')
+        #print(model.summary())
+
+        model.compile(optimizer=self.adam,
+                      loss='categorical_crossentropy',
+                      metrics=['accuracy'])
+        self.model = model
+        return model
+
+    def callbacks(self):
+        tbCallBack = TensorBoard(log_dir=os.path.join(self.log_path, self.ex_name),
+                                 histogram_freq=0,
+                                 write_graph=True,
+                                 write_images=True,
+                                 )
+
+        tbCallBack.set_model(self.model)
+
+        check_point = ModelCheckpoint(os.path.join(self.weight_path, self.ex_name + ".h5"),
+                                                      monitor='acc',
+                                                      verbose=1,
+                                                      save_weights_only=True,
+                                                      save_best_only=True,
+                                                      mode='max',
+                                                      )
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=20, min_lr=0.0001)
+
+        def scheduler(epoch):
+            if epoch % 20 == 0 and epoch != 0:
+                lr = K.get_value(model.optimizer.lr)
+                K.set_value(model.optimizer.lr, lr * 0.95)
+                print("LR changed to {}".format(lr * 0.95))
+            return K.get_value(model.optimizer.lr)
+
+        scheduler_lr = LearningRateScheduler(scheduler)
+        callbacks = [check_point, tbCallBack, scheduler_lr]
+        return callbacks
+
+class Data_generator():
+    def __init__(self, batch_size, train_path, classes):
+        self.batch_size = batch_size
+        self.train_path = train_path
+        self.classes = classes
+        self.datas = []
+        self.labels = []
+        self.num_batchs = 0
+        self.load_data()
+
+    def load_data(self):
+        data, label = util.load_h5(self.train_path)
+        data, label, _ = util.shuffle_data(data, np.squeeze(label))
+        label = np.squeeze(label)
+        file_size = data.shape[0]
+        num_batches = file_size // self.batch_size
+        self.datas = data
+        self.labels = label
+        self.num_batchs = num_batches
+
+    def traindata(self, Augment=True):
+        while True:
+            for batch_idx in range(self.num_batchs):
+                start_idx = batch_idx * self.batch_size
+                end_idx = (batch_idx + 1) * self.batch_size
+                points_batch = self.datas[start_idx:end_idx, :, :]
+                labels_batch = self.labels[start_idx:end_idx]
+                labels_batch = np_utils.to_categorical(labels_batch, self.classes)
+                if Augment:
+                    train_points_rotate = util.rotate_point_cloud(points_batch)
+                    points_batch = util.jitter_point_cloud(train_points_rotate)
+                yield (points_batch, labels_batch)
+
+if __name__ == '__main__':
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    train_path = 'C:/download/3DNet/pointnet-keras-master/data/modelnet40_ply_hdf5_2048/ply_data_train0.h5'
+    batch_size = 32
+    classes = 40
+    PointNet_cls = PointNet(num_points=2048, classes=classes, batch_size=batch_size)
+    model = PointNet_cls.CreateNet(Inital_weight=False)
+    callbacks = PointNet_cls.callbacks()
+    generator = Data_generator(train_path=train_path, batch_size=batch_size, classes=classes)
+    print('Start training...')
+    while True:
+        model.fit_generator(generator.traindata(Augment=True),
+                            steps_per_epoch=100,
+                            epochs=10000, verbose=1,
+                            callbacks=callbacks,
+                            shuffle=True)
